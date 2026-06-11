@@ -1,0 +1,3 @@
+signing/key.pem
+signing/*.pfx
+signing/pfx-wachtwoord.txt

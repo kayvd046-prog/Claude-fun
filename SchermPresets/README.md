@@ -25,9 +25,22 @@ beeldscherminstellingen opslaat als presets en er met één klik tussen wisselt.
 
 Presets worden opgeslagen in `%APPDATA%\SchermPresets`.
 
-> **Let op:** Windows SmartScreen kan bij de eerste start een waarschuwing
-> tonen omdat de exe niet digitaal ondertekend is. Kies dan
-> *Meer informatie → Toch uitvoeren*.
+## Digitale handtekening
+
+De exe is ondertekend met een **zelf-ondertekend** certificaat
+(`dist/SchermPresets-certificaat.cer`). Windows vertrouwt dat niet
+automatisch; wil je dat de handtekening als geldig wordt getoond, importeer
+het certificaat dan eenmalig:
+
+1. Dubbelklik op `SchermPresets-certificaat.cer` → **Certificaat installeren**.
+2. Kies *Huidige gebruiker* → *Alle certificaten in het volgende archief opslaan*
+   → **Vertrouwde basiscertificeringsinstanties** → Voltooien.
+
+> **Let op:** Windows SmartScreen kan bij de eerste start alsnog een
+> waarschuwing tonen — SmartScreen kijkt naar reputatie, niet alleen naar de
+> handtekening. Kies dan *Meer informatie → Toch uitvoeren* (eenmalig).
+> Een waarschuwingsvrije start vereist een betaald code signing-certificaat
+> van een CA (bijv. Azure Trusted Signing of Sectigo).
 
 ## Hoe het werkt
 
