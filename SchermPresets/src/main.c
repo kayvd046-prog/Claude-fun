@@ -367,6 +367,90 @@ static void PaintCanvas(HWND hwnd)
     EndPaint(hwnd, &ps);
 }
 
+/* ======================================================== */
+/* Monitor direct aan/uitzetten via CCD                     */
+/* ======================================================== */
+
+static void ToggleMonitorLive(int idx)
+{
+    Monitor *mon = &g_mon[idx];
+
+    if (mon->enabled) {
+        /* --- Uitzetten: verwijder dit scherm uit de actieve paden --- */
+        DISPLAYCONFIG_PATH_INFO *paths; DISPLAYCONFIG_MODE_INFO *modes;
+        UINT32 np, nm;
+        if (QueryCCD(&paths, &np, &modes, &nm, QDC_ONLY_ACTIVE_PATHS) != ERROR_SUCCESS) {
+            SetStatus(L"Kon schermconfiguratie niet opvragen."); return;
+        }
+
+        DISPLAYCONFIG_PATH_INFO filtered[64]; UINT32 nf = 0;
+        for (UINT32 i = 0; i < np; i++) {
+            if (!(LuidEq(paths[i].targetInfo.adapterId, mon->adapterId) &&
+                  paths[i].targetInfo.id == mon->targetId))
+                filtered[nf++] = paths[i];
+        }
+        free(modes);
+
+        LONG rc = SetDisplayConfig(nf, filtered, 0, NULL,
+                                   SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                                   SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+        free(paths);
+
+        if (rc != ERROR_SUCCESS) {
+            SetStatus(L"Uitzetten van '%s' mislukt (fout %ld).", mon->name, rc); return;
+        }
+        SetStatus(L"Scherm '%s' uitgeschakeld.", mon->name);
+
+    } else {
+        /* --- Aanzetten: voeg dit scherm toe aan de actieve paden --- */
+        DISPLAYCONFIG_PATH_INFO *allPaths; DISPLAYCONFIG_MODE_INFO *allModes;
+        UINT32 nap, nam;
+        if (QueryCCD(&allPaths, &nap, &allModes, &nam, QDC_ALL_PATHS) != ERROR_SUCCESS) {
+            SetStatus(L"Kon schermconfiguratie niet opvragen."); return;
+        }
+
+        /* Zoek het pad voor dit target in QDC_ALL_PATHS */
+        DISPLAYCONFIG_PATH_INFO newPath; BOOL found = FALSE;
+        for (UINT32 i = 0; i < nap; i++) {
+            if (LuidEq(allPaths[i].targetInfo.adapterId, mon->adapterId) &&
+                allPaths[i].targetInfo.id == mon->targetId) {
+                newPath = allPaths[i];
+                newPath.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+                newPath.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+                newPath.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+                found = TRUE; break;
+            }
+        }
+        free(allPaths); free(allModes);
+
+        if (!found) { SetStatus(L"Pad voor '%s' niet gevonden.", mon->name); return; }
+
+        /* Huidige actieve paden + nieuw pad */
+        DISPLAYCONFIG_PATH_INFO *actPaths; DISPLAYCONFIG_MODE_INFO *actModes;
+        UINT32 nact, nactm;
+        if (QueryCCD(&actPaths, &nact, &actModes, &nactm, QDC_ONLY_ACTIVE_PATHS) != ERROR_SUCCESS) {
+            SetStatus(L"Kon actieve schermen niet opvragen."); return;
+        }
+
+        DISPLAYCONFIG_PATH_INFO combined[65];
+        memcpy(combined, actPaths, nact * sizeof(*actPaths));
+        combined[nact] = newPath;
+        free(actPaths); free(actModes);
+
+        LONG rc = SetDisplayConfig(nact + 1, combined, 0, NULL,
+                                   SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                                   SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+        if (rc != ERROR_SUCCESS) {
+            SetStatus(L"Aanzetten van '%s' mislukt (fout %ld).", mon->name, rc); return;
+        }
+        SetStatus(L"Scherm '%s' ingeschakeld.", mon->name);
+    }
+
+    /* Herlaad de kaart om de nieuwe live-staat te tonen */
+    LoadMonitors();
+    if (g_hCanvas) InvalidateRect(g_hCanvas, NULL, TRUE);
+}
+
 static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -376,26 +460,23 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     case WM_LBUTTONDOWN: {
         RECT cr; GetClientRect(hwnd, &cr);
-        /* GET_X/Y_LPARAM levert correcte signed waarden op alle DPI-schalen */
         int mx = GET_X_LPARAM(lParam), my = GET_Y_LPARAM(lParam);
         int idx = HitTest(cr.right, cr.bottom, mx, my);
         if (idx < 0) return 0;
 
-        int aantalAan = 0;
-        for (int k = 0; k < g_nMon; k++) aantalAan += g_mon[k].enabled;
-
-        if (g_mon[idx].enabled && aantalAan <= 1) {
-            SetStatus(L"'%s' kan niet uit: minimaal één scherm moet aan blijven.",
-                      g_mon[idx].name);
-            return 0;
+        /* Blokkeer uitzetten van het laatste actieve scherm */
+        if (g_mon[idx].enabled) {
+            int aantalAan = 0;
+            for (int k = 0; k < g_nMon; k++) aantalAan += g_mon[k].enabled;
+            if (aantalAan <= 1) {
+                SetStatus(L"'%s' kan niet uit: minimaal één scherm moet aan blijven.",
+                          g_mon[idx].name);
+                return 0;
+            }
         }
-        g_mon[idx].enabled = !g_mon[idx].enabled;
-        InvalidateRect(hwnd, NULL, FALSE);
-        aantalAan += g_mon[idx].enabled ? 1 : -1;
-        SetStatus(L"Scherm '%s' %s  (%d van %d aan).",
-                  g_mon[idx].name,
-                  g_mon[idx].enabled ? L"AAN" : L"UIT",
-                  aantalAan, g_nMon);
+
+        /* Pas direct toe in Windows */
+        ToggleMonitorLive(idx);
         return 0;
     }
 
@@ -445,6 +526,8 @@ static BOOL IsValidName(const WCHAR *name)
 
 static BOOL SaveCurrentAsPreset(const WCHAR *name)
 {
+    /* Sla de huidige live schermindeling op — klikken in de kaart past die
+     * al direct aan in Windows, dus QDC_ONLY_ACTIVE_PATHS is altijd correct. */
     DISPLAYCONFIG_PATH_INFO *paths = NULL;
     DISPLAYCONFIG_MODE_INFO *modes = NULL;
     UINT32 np = 0, nm = 0;
@@ -455,30 +538,8 @@ static BOOL SaveCurrentAsPreset(const WCHAR *name)
         return FALSE;
     }
 
-    /* Filter paden op basis van de toggle-staat in de kaart */
-    DISPLAYCONFIG_PATH_INFO filtered[64];
-    UINT32 nf = 0;
-    for (UINT32 i = 0; i < np; i++) {
-        BOOL keep = TRUE;
-        for (int k = 0; k < g_nMon; k++) {
-            if (LuidEq(paths[i].targetInfo.adapterId, g_mon[k].adapterId) &&
-                paths[i].targetInfo.id == g_mon[k].targetId) {
-                if (!g_mon[k].enabled) keep = FALSE;
-                break;
-            }
-        }
-        if (keep && nf < 64)
-            filtered[nf++] = paths[i];
-    }
-
-    if (nf == 0) {
-        SetStatus(L"Sla minimaal één scherm op.");
-        free(paths); free(modes);
-        return FALSE;
-    }
-
     AdapterRecord adapters[MAX_ADAPTERS];
-    DWORD na = CollectAdapters(filtered, nf, adapters, MAX_ADAPTERS);
+    DWORD na = CollectAdapters(paths, np, adapters, MAX_ADAPTERS);
 
     WCHAR fpath[MAX_PATH];
     if (!GetPresetPath(name, fpath, MAX_PATH)) { free(paths); free(modes); return FALSE; }
@@ -487,24 +548,20 @@ static BOOL SaveCurrentAsPreset(const WCHAR *name)
                            FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         SetStatus(L"Kon presetbestand niet aanmaken.");
-        free(paths); free(modes);
-        return FALSE;
+        free(paths); free(modes); return FALSE;
     }
 
-    PresetHeader hdr = { PRESET_MAGIC, PRESET_VERSION, nf, nm, na };
+    PresetHeader hdr = { PRESET_MAGIC, PRESET_VERSION, np, nm, na };
     DWORD w;
-    BOOL ok = WriteFile(h, &hdr,      sizeof(hdr),          &w, NULL) &&
-              WriteFile(h, filtered,  nf * sizeof(*filtered), &w, NULL) &&
-              WriteFile(h, modes,     nm * sizeof(*modes),   &w, NULL) &&
-              WriteFile(h, adapters,  na * sizeof(*adapters), &w, NULL);
+    BOOL ok = WriteFile(h, &hdr,     sizeof(hdr),         &w, NULL) &&
+              WriteFile(h, paths,    np * sizeof(*paths),  &w, NULL) &&
+              WriteFile(h, modes,    nm * sizeof(*modes),  &w, NULL) &&
+              WriteFile(h, adapters, na * sizeof(*adapters), &w, NULL);
     CloseHandle(h);
     free(paths); free(modes);
 
     if (!ok) { DeleteFileW(fpath); SetStatus(L"Schrijven van preset is mislukt."); return FALSE; }
-
-    int aan = 0;
-    for (int k = 0; k < g_nMon; k++) aan += g_mon[k].enabled;
-    SetStatus(L"Preset '%s' opgeslagen (%d scherm(en) aan).", name, aan);
+    SetStatus(L"Preset '%s' opgeslagen (%u actieve schermen).", name, np);
     return TRUE;
 }
 
