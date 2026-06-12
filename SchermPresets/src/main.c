@@ -17,6 +17,7 @@
 #define WINVER 0x0602
 
 #include <windows.h>
+#include <windowsx.h>
 #include <shlobj.h>
 #include <shellapi.h>
 #include <strsafe.h>
@@ -163,45 +164,79 @@ static void LoadMonitors(void)
     UINT32 np = 0, nm = 0;
 
     g_nMon = 0;
-    if (QueryCCD(&paths, &np, &modes, &nm, QDC_ONLY_ACTIVE_PATHS) != ERROR_SUCCESS)
+    /* QDC_ALL_PATHS geeft ook inactieve (uitgeschakelde) monitoren terug. */
+    if (QueryCCD(&paths, &np, &modes, &nm, QDC_ALL_PATHS) != ERROR_SUCCESS)
         return;
 
-    for (UINT32 i = 0; i < np && g_nMon < MAX_MON; i++) {
-        Monitor *mon = &g_mon[g_nMon];
+    /* We tellen bij elkaar op hoever de actieve monitoren reiken zodat we
+     * inactieve monitoren rechts ernaast kunnen plaatsen. */
+    LONG placeholderX = 0;
 
-        /* Vriendelijke naam ophalen */
+    /* Bijhouden welke targets al verwerkt zijn (QDC_ALL_PATHS levert per
+     * target meerdere paden op voor elke mogelijke bron). */
+    typedef struct { LUID adp; UINT32 tid; } Seen;
+    Seen seen[64]; int nSeen = 0;
+
+    for (UINT32 i = 0; i < np && g_nMon < MAX_MON; i++) {
+        /* Sla duplicaten over */
+        BOOL dup = FALSE;
+        for (int k = 0; k < nSeen; k++)
+            if (LuidEq(seen[k].adp, paths[i].targetInfo.adapterId) &&
+                seen[k].tid == paths[i].targetInfo.id) { dup = TRUE; break; }
+        if (dup) continue;
+
+        BOOL active = (paths[i].flags & DISPLAYCONFIG_PATH_ACTIVE) != 0;
+
+        /* Naam ophalen; sla het pad over als er geen monitor aangesloten is */
         DISPLAYCONFIG_TARGET_DEVICE_NAME tdn = {0};
         tdn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
         tdn.header.size = sizeof(tdn);
         tdn.header.adapterId = paths[i].targetInfo.adapterId;
         tdn.header.id = paths[i].targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&tdn.header) == ERROR_SUCCESS &&
-            tdn.monitorFriendlyDeviceName[0])
+        BOOL hasName = DisplayConfigGetDeviceInfo(&tdn.header) == ERROR_SUCCESS &&
+                       tdn.monitorFriendlyDeviceName[0];
+
+        /* Sla over als niet actief én geen naam (fysiek niet aangesloten) */
+        if (!active && !hasName) continue;
+
+        Monitor *mon = &g_mon[g_nMon];
+        if (hasName)
             StringCchCopyW(mon->name, 64, tdn.monitorFriendlyDeviceName);
         else
             StringCchPrintfW(mon->name, 64, L"Scherm %d", g_nMon + 1);
 
-        /* Positie en resolutie uit de bronmodus */
-        UINT32 srcIdx = paths[i].sourceInfo.modeInfoIdx;
-        if (srcIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && srcIdx < nm &&
-            modes[srcIdx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
-            DISPLAYCONFIG_SOURCE_MODE *sm = &modes[srcIdx].sourceMode;
-            mon->vRect.left   = sm->position.x;
-            mon->vRect.top    = sm->position.y;
-            mon->vRect.right  = sm->position.x + (LONG)sm->width;
-            mon->vRect.bottom = sm->position.y + (LONG)sm->height;
+        if (active) {
+            /* Positie uit de bronmodus */
+            UINT32 srcIdx = paths[i].sourceInfo.modeInfoIdx;
+            if (srcIdx != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && srcIdx < nm &&
+                modes[srcIdx].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+                DISPLAYCONFIG_SOURCE_MODE *sm = &modes[srcIdx].sourceMode;
+                mon->vRect.left   = sm->position.x;
+                mon->vRect.top    = sm->position.y;
+                mon->vRect.right  = sm->position.x + (LONG)sm->width;
+                mon->vRect.bottom = sm->position.y + (LONG)sm->height;
+                if (mon->vRect.right > placeholderX) placeholderX = mon->vRect.right;
+            } else {
+                mon->vRect.left = placeholderX; mon->vRect.top = 0;
+                mon->vRect.right = placeholderX + 1920; mon->vRect.bottom = 1080;
+                placeholderX += 1920 + 40;
+            }
         } else {
-            /* Fallback: kleine tijdelijke rechthoek */
-            mon->vRect.left = g_nMon * 200;
-            mon->vRect.top  = 0;
-            mon->vRect.right  = mon->vRect.left + 160;
-            mon->vRect.bottom = 90;
+            /* Inactieve monitor: placeholder rechts van de actieve schermen */
+            mon->vRect.left   = placeholderX + 40;
+            mon->vRect.top    = 0;
+            mon->vRect.right  = placeholderX + 40 + 1920;
+            mon->vRect.bottom = 1080;
+            placeholderX = mon->vRect.right;
         }
 
-        mon->enabled   = TRUE;
+        mon->enabled   = active;
         mon->adapterId = paths[i].targetInfo.adapterId;
         mon->targetId  = paths[i].targetInfo.id;
         mon->sourceId  = paths[i].sourceInfo.id;
+
+        if (nSeen < 64) { seen[nSeen].adp = paths[i].targetInfo.adapterId;
+                          seen[nSeen].tid = paths[i].targetInfo.id; nSeen++; }
         g_nMon++;
     }
 
@@ -341,24 +376,26 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
 
     case WM_LBUTTONDOWN: {
         RECT cr; GetClientRect(hwnd, &cr);
-        int idx = HitTest(cr.right, cr.bottom, LOWORD(lParam), HIWORD(lParam));
-        if (idx >= 0) {
-            /* Minimaal één scherm moet aan blijven */
-            int aantalAan = 0;
-            for (int k = 0; k < g_nMon; k++) aantalAan += g_mon[k].enabled;
-            if (g_mon[idx].enabled && aantalAan <= 1) {
-                SetStatus(L"Minimaal één scherm moet aan blijven.");
-                return 0;
-            }
-            g_mon[idx].enabled = !g_mon[idx].enabled;
-            InvalidateRect(hwnd, NULL, FALSE);
-            int aan = 0;
-            for (int k = 0; k < g_nMon; k++) aan += g_mon[k].enabled;
-            SetStatus(L"Scherm '%s' %s — %d van %d schermen aan.",
-                      g_mon[idx].name,
-                      g_mon[idx].enabled ? L"ingeschakeld" : L"uitgeschakeld",
-                      aan, g_nMon);
+        /* GET_X/Y_LPARAM levert correcte signed waarden op alle DPI-schalen */
+        int mx = GET_X_LPARAM(lParam), my = GET_Y_LPARAM(lParam);
+        int idx = HitTest(cr.right, cr.bottom, mx, my);
+        if (idx < 0) return 0;
+
+        int aantalAan = 0;
+        for (int k = 0; k < g_nMon; k++) aantalAan += g_mon[k].enabled;
+
+        if (g_mon[idx].enabled && aantalAan <= 1) {
+            SetStatus(L"'%s' kan niet uit: minimaal één scherm moet aan blijven.",
+                      g_mon[idx].name);
+            return 0;
         }
+        g_mon[idx].enabled = !g_mon[idx].enabled;
+        InvalidateRect(hwnd, NULL, FALSE);
+        aantalAan += g_mon[idx].enabled ? 1 : -1;
+        SetStatus(L"Scherm '%s' %s  (%d van %d aan).",
+                  g_mon[idx].name,
+                  g_mon[idx].enabled ? L"AAN" : L"UIT",
+                  aantalAan, g_nMon);
         return 0;
     }
 
