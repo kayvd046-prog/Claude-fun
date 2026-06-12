@@ -382,60 +382,75 @@ static void ToggleMonitorLive(int idx)
         if (QueryCCD(&paths, &np, &modes, &nm, QDC_ONLY_ACTIVE_PATHS) != ERROR_SUCCESS) {
             SetStatus(L"Kon schermconfiguratie niet opvragen."); return;
         }
+        free(modes);
 
         DISPLAYCONFIG_PATH_INFO filtered[64]; UINT32 nf = 0;
         for (UINT32 i = 0; i < np; i++) {
-            if (!(LuidEq(paths[i].targetInfo.adapterId, mon->adapterId) &&
-                  paths[i].targetInfo.id == mon->targetId))
-                filtered[nf++] = paths[i];
+            if (LuidEq(paths[i].targetInfo.adapterId, mon->adapterId) &&
+                paths[i].targetInfo.id == mon->targetId) continue;
+            filtered[nf] = paths[i];
+            /* Wis modeInfoIdx: we geven geen modes mee, SDC_ALLOW_CHANGES
+             * laat Windows zelf modi kiezen voor de resterende schermen. */
+            filtered[nf].sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            filtered[nf].targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            nf++;
         }
-        free(modes);
+        free(paths);
 
         LONG rc = SetDisplayConfig(nf, filtered, 0, NULL,
                                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
                                    SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
-        free(paths);
-
         if (rc != ERROR_SUCCESS) {
             SetStatus(L"Uitzetten van '%s' mislukt (fout %ld).", mon->name, rc); return;
         }
         SetStatus(L"Scherm '%s' uitgeschakeld.", mon->name);
 
     } else {
-        /* --- Aanzetten: voeg dit scherm toe aan de actieve paden --- */
+        /* --- Aanzetten: voeg dit scherm toe aan de actieve paden ---
+         *
+         * Strategie: pak de huidige actieve paden, voeg het gewenste
+         * inactive pad toe, wis alle modeInfoIdx en laat Windows de
+         * modi opnieuw berekenen via SDC_ALLOW_CHANGES.              */
         DISPLAYCONFIG_PATH_INFO *allPaths; DISPLAYCONFIG_MODE_INFO *allModes;
         UINT32 nap, nam;
         if (QueryCCD(&allPaths, &nap, &allModes, &nam, QDC_ALL_PATHS) != ERROR_SUCCESS) {
             SetStatus(L"Kon schermconfiguratie niet opvragen."); return;
         }
+        free(allModes);
 
-        /* Zoek het pad voor dit target in QDC_ALL_PATHS */
+        /* Zoek het pad voor dit target */
         DISPLAYCONFIG_PATH_INFO newPath; BOOL found = FALSE;
-        for (UINT32 i = 0; i < nap; i++) {
+        for (UINT32 i = 0; i < nap && !found; i++) {
             if (LuidEq(allPaths[i].targetInfo.adapterId, mon->adapterId) &&
                 allPaths[i].targetInfo.id == mon->targetId) {
                 newPath = allPaths[i];
-                newPath.flags |= DISPLAYCONFIG_PATH_ACTIVE;
-                newPath.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
-                newPath.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
-                found = TRUE; break;
+                found = TRUE;
             }
         }
-        free(allPaths); free(allModes);
-
+        free(allPaths);
         if (!found) { SetStatus(L"Pad voor '%s' niet gevonden.", mon->name); return; }
 
-        /* Huidige actieve paden + nieuw pad */
+        /* Huidige actieve paden ophalen */
         DISPLAYCONFIG_PATH_INFO *actPaths; DISPLAYCONFIG_MODE_INFO *actModes;
         UINT32 nact, nactm;
         if (QueryCCD(&actPaths, &nact, &actModes, &nactm, QDC_ONLY_ACTIVE_PATHS) != ERROR_SUCCESS) {
             SetStatus(L"Kon actieve schermen niet opvragen."); return;
         }
+        free(actModes);
 
+        /* Combineer: bestaande actieve paden + nieuw pad */
         DISPLAYCONFIG_PATH_INFO combined[65];
-        memcpy(combined, actPaths, nact * sizeof(*actPaths));
+        for (UINT32 i = 0; i < nact; i++) {
+            combined[i] = actPaths[i];
+            combined[i].sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            combined[i].targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        }
+        free(actPaths);
+
+        newPath.flags |= DISPLAYCONFIG_PATH_ACTIVE;
+        newPath.sourceInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        newPath.targetInfo.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
         combined[nact] = newPath;
-        free(actPaths); free(actModes);
 
         LONG rc = SetDisplayConfig(nact + 1, combined, 0, NULL,
                                    SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
