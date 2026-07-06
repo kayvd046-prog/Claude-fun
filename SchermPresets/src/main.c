@@ -18,6 +18,7 @@
 
 #include <windows.h>
 #include <windowsx.h>
+#include <commctrl.h>
 #include <shlobj.h>
 #include <shellapi.h>
 #include <strsafe.h>
@@ -52,6 +53,7 @@ typedef struct {
     WCHAR  name[64];    /* vriendelijke naam, bijv. "Dell U2722D" */
     RECT   vRect;       /* positie in het virtuele bureaublad      */
     BOOL   enabled;     /* TRUE = opnemen in preset                */
+    int    width, height; /* resolutie voor het label              */
     LUID   adapterId;
     UINT32 targetId;
     UINT32 sourceId;
@@ -59,6 +61,7 @@ typedef struct {
 
 static Monitor g_mon[MAX_MON];
 static int     g_nMon;
+static int     g_hover = -1;   /* monitor onder de muis, -1 = geen */
 static HWND    g_hCanvas;
 
 /* Kleuren per monitor (BGR voor GDI) */
@@ -85,9 +88,10 @@ static const COLORREF MON_CLR[] = {
 #define IDC_BTN_SECOND  110
 #define IDC_STATUS      111
 #define IDC_BTN_RELOAD  112
+#define IDC_HINT        113
 
 static HWND  g_hList, g_hEdit, g_hStatus;
-static HFONT g_hFont, g_hFontSm;
+static HFONT g_hFont, g_hFontSm, g_hFontBold, g_hFontBig;
 static int   g_dpi = 96;
 
 #define S(x) MulDiv((x), g_dpi, 96)
@@ -164,6 +168,7 @@ static void LoadMonitors(void)
     UINT32 np = 0, nm = 0;
 
     g_nMon = 0;
+    g_hover = -1;
     /* QDC_ALL_PATHS geeft ook inactieve (uitgeschakelde) monitoren terug. */
     if (QueryCCD(&paths, &np, &modes, &nm, QDC_ALL_PATHS) != ERROR_SUCCESS)
         return;
@@ -215,10 +220,13 @@ static void LoadMonitors(void)
                 mon->vRect.top    = sm->position.y;
                 mon->vRect.right  = sm->position.x + (LONG)sm->width;
                 mon->vRect.bottom = sm->position.y + (LONG)sm->height;
+                mon->width  = (int)sm->width;
+                mon->height = (int)sm->height;
                 if (mon->vRect.right > placeholderX) placeholderX = mon->vRect.right;
             } else {
                 mon->vRect.left = placeholderX; mon->vRect.top = 0;
                 mon->vRect.right = placeholderX + 1920; mon->vRect.bottom = 1080;
+                mon->width = 1920; mon->height = 1080;
                 placeholderX += 1920 + 40;
             }
         } else {
@@ -227,6 +235,7 @@ static void LoadMonitors(void)
             mon->vRect.top    = 0;
             mon->vRect.right  = placeholderX + 40 + 1920;
             mon->vRect.bottom = 1080;
+            mon->width = 0; mon->height = 0;
             placeholderX = mon->vRect.right;
         }
 
@@ -298,72 +307,114 @@ static int HitTest(int cw, int ch, int mx, int my)
     return -1;
 }
 
+static COLORREF Lighten(COLORREF c, int d)
+{
+    return RGB(min(255, GetRValue(c) + d),
+               min(255, GetGValue(c) + d),
+               min(255, GetBValue(c) + d));
+}
+
 static void PaintCanvas(HWND hwnd)
 {
     PAINTSTRUCT ps;
-    HDC hdc = BeginPaint(hwnd, &ps);
+    HDC wdc = BeginPaint(hwnd, &ps);
     RECT cr; GetClientRect(hwnd, &cr);
     int cw = cr.right, ch = cr.bottom;
 
-    /* Achtergrond */
-    HBRUSH hBg = CreateSolidBrush(RGB(30, 30, 40));
+    /* Double buffering: teken alles in een geheugen-DC tegen flikkeren */
+    HDC hdc = CreateCompatibleDC(wdc);
+    HBITMAP hBmp = CreateCompatibleBitmap(wdc, cw, ch);
+    HBITMAP hOldBmp = SelectObject(hdc, hBmp);
+
+    /* Donkere achtergrond */
+    HBRUSH hBg = CreateSolidBrush(RGB(24, 26, 32));
     FillRect(hdc, &cr, hBg);
     DeleteObject(hBg);
 
-    if (g_nMon == 0) {
-        SetBkColor(hdc, RGB(30, 30, 40));
-        SetTextColor(hdc, RGB(180, 180, 180));
-        SelectObject(hdc, g_hFontSm);
-        DrawTextW(hdc, L"Geen actieve schermen gevonden.", -1, &cr,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        EndPaint(hwnd, &ps);
-        return;
-    }
-
-    SelectObject(hdc, g_hFontSm);
     SetBkMode(hdc, TRANSPARENT);
+
+    if (g_nMon == 0) {
+        SetTextColor(hdc, RGB(150, 155, 165));
+        SelectObject(hdc, g_hFontSm);
+        DrawTextW(hdc, L"Geen schermen gevonden. Klik op 'Indeling herladen'.",
+                  -1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
 
     for (int i = 0; i < g_nMon; i++) {
         RECT r = ScaleMonRect(cw, ch, i);
         COLORREF baseClr = MON_CLR[i % 8];
         BOOL on = g_mon[i].enabled;
+        BOOL hov = (i == g_hover);
+        int rad = S(8);
 
-        /* Vul rechthoek */
-        COLORREF fill = on ? baseClr : RGB(60, 60, 65);
+        /* Vulling: kleur voor aan, donkergrijs voor uit; hover licht op */
+        COLORREF fill = on ? baseClr : RGB(48, 50, 56);
+        if (hov) fill = Lighten(fill, 22);
+
+        COLORREF border = on ? Lighten(baseClr, 70) : RGB(95, 98, 108);
+        if (hov) border = Lighten(border, 40);
+
         HBRUSH hFill = CreateSolidBrush(fill);
-        FillRect(hdc, &r, hFill);
-        DeleteObject(hFill);
-
-        /* Rand */
-        COLORREF border = on ? RGB(
-            min(255, GetRValue(baseClr) + 60),
-            min(255, GetGValue(baseClr) + 60),
-            min(255, GetBValue(baseClr) + 60))
-            : RGB(100, 100, 110);
-        HPEN hPen = CreatePen(PS_SOLID, 2, border);
-        HPEN hOld = SelectObject(hdc, hPen);
-        HBRUSH hNull = GetStockObject(NULL_BRUSH);
-        HBRUSH hOldBr = SelectObject(hdc, hNull);
-        Rectangle(hdc, r.left, r.top, r.right, r.bottom);
-        SelectObject(hdc, hOld);
+        HPEN hPen = CreatePen(on ? PS_SOLID : PS_DASH, on ? 2 : 1, border);
+        HBRUSH hOldBr = SelectObject(hdc, hFill);
+        HPEN hOldPen = SelectObject(hdc, hPen);
+        RoundRect(hdc, r.left, r.top, r.right, r.bottom, rad, rad);
         SelectObject(hdc, hOldBr);
+        SelectObject(hdc, hOldPen);
+        DeleteObject(hFill);
         DeleteObject(hPen);
 
-        /* Naam + status */
-        SetTextColor(hdc, on ? RGB(255,255,255) : RGB(140,140,145));
-        RECT tr = r;
-        InflateRect(&tr, -4, -3);
-        DrawTextW(hdc, g_mon[i].name, -1, &tr,
-                  DT_CENTER | DT_TOP | DT_WORDBREAK | DT_END_ELLIPSIS);
+        /* Groot schermnummer in het midden (zoals Windows-instellingen) */
+        WCHAR num[8];
+        StringCchPrintfW(num, 8, L"%d", i + 1);
+        SelectObject(hdc, g_hFontBig);
+        SetTextColor(hdc, on ? Lighten(baseClr, 110) : RGB(120, 123, 132));
+        DrawTextW(hdc, num, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-        const WCHAR *badge = on ? L"AAN" : L"UIT";
-        RECT br = r;
-        br.top = br.bottom - S(16);
-        InflateRect(&br, -4, -2);
-        SetTextColor(hdc, on ? RGB(200,255,200) : RGB(255,160,160));
-        DrawTextW(hdc, badge, -1, &br, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        /* Monitornaam bovenin */
+        SelectObject(hdc, g_hFontSm);
+        SetTextColor(hdc, on ? RGB(255,255,255) : RGB(150,153,162));
+        RECT tr = r;
+        InflateRect(&tr, -S(6), -S(4));
+        DrawTextW(hdc, g_mon[i].name, -1, &tr,
+                  DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+        /* Onderregel: resolutie links, AAN/UIT-pil rechts */
+        if (on && g_mon[i].width > 0) {
+            WCHAR res[32];
+            StringCchPrintfW(res, 32, L"%d×%d", g_mon[i].width, g_mon[i].height);
+            RECT rr = r;
+            rr.top = rr.bottom - S(18);
+            InflateRect(&rr, -S(6), 0);
+            rr.bottom -= S(4);
+            SetTextColor(hdc, Lighten(baseClr, 100));
+            DrawTextW(hdc, res, -1, &rr, DT_LEFT | DT_BOTTOM | DT_SINGLELINE);
+        }
+
+        /* Statuspil rechtsonder */
+        {
+            const WCHAR *badge = on ? L"AAN" : L"UIT";
+            int pw = S(34), ph = S(15);
+            RECT pr = { r.right - pw - S(5), r.bottom - ph - S(4),
+                        r.right - S(5),      r.bottom - S(4) };
+            HBRUSH hPill = CreateSolidBrush(on ? RGB(28, 92, 48) : RGB(96, 40, 44));
+            HPEN hPPen = CreatePen(PS_SOLID, 1, on ? RGB(70, 170, 100) : RGB(170, 90, 95));
+            HBRUSH ob = SelectObject(hdc, hPill);
+            HPEN op = SelectObject(hdc, hPPen);
+            RoundRect(hdc, pr.left, pr.top, pr.right, pr.bottom, ph, ph);
+            SelectObject(hdc, ob);
+            SelectObject(hdc, op);
+            DeleteObject(hPill);
+            DeleteObject(hPPen);
+            SetTextColor(hdc, on ? RGB(190, 255, 205) : RGB(255, 185, 190));
+            DrawTextW(hdc, badge, -1, &pr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
     }
 
+    BitBlt(wdc, 0, 0, cw, ch, hdc, 0, 0, SRCCOPY);
+    SelectObject(hdc, hOldBmp);
+    DeleteObject(hBmp);
+    DeleteDC(hdc);
     EndPaint(hwnd, &ps);
 }
 
@@ -471,6 +522,29 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     switch (msg) {
     case WM_PAINT:
         PaintCanvas(hwnd);
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;   /* alles wordt in PaintCanvas getekend (double buffered) */
+
+    case WM_MOUSEMOVE: {
+        RECT cr; GetClientRect(hwnd, &cr);
+        int idx = HitTest(cr.right, cr.bottom,
+                          GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        if (idx != g_hover) {
+            g_hover = idx;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        if (g_hover != -1) {
+            g_hover = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         return 0;
 
     case WM_LBUTTONDOWN: {
@@ -793,48 +867,58 @@ static HWND MakeCtrl(HWND parent, const WCHAR *cls, const WCHAR *text,
     return hw;
 }
 
+static HWND MakeHeader(HWND parent, const WCHAR *text, int x, int y, int w)
+{
+    HWND h = MakeCtrl(parent, L"STATIC", text, 0, x, y, w, 17, 0);
+    SendMessageW(h, WM_SETFONT, (WPARAM)g_hFontBold, TRUE);
+    return h;
+}
+
 static void CreateControls(HWND hwnd)
 {
     /* --- Monitorkaart --- */
-    MakeCtrl(hwnd, L"STATIC",
-             L"Schermen  —  klik op een scherm om het aan/uit te zetten in de preset:",
-             0, 12, 8, 516, 16, 0);
+    MakeHeader(hwnd, L"Schermen", 14, 10, 200);
 
-    g_hCanvas = CreateWindowExW(WS_EX_CLIENTEDGE, L"SchermPresetsCanvas", NULL,
-                                WS_CHILD|WS_VISIBLE,
-                                S(12), S(28), S(516), S(148), hwnd,
+    g_hCanvas = CreateWindowExW(0, L"SchermPresetsCanvas", NULL,
+                                WS_CHILD|WS_VISIBLE|WS_BORDER,
+                                S(14), S(30), S(532), S(170), hwnd,
                                 (HMENU)(INT_PTR)IDC_CANVAS, GetModuleHandleW(NULL), NULL);
 
-    MakeCtrl(hwnd, L"BUTTON", L"Indeling herladen", 0, 12, 182, 148, 24, IDC_BTN_RELOAD);
+    MakeCtrl(hwnd, L"BUTTON", L"Indeling herladen", 0, 14, 208, 140, 26, IDC_BTN_RELOAD);
+    MakeCtrl(hwnd, L"STATIC",
+             L"Klik op een scherm om het direct aan of uit te zetten.",
+             SS_LEFTNOWORDWRAP | SS_CENTERIMAGE, 164, 208, 382, 26, IDC_HINT);
 
     /* --- Presetlijst --- */
-    MakeCtrl(hwnd, L"STATIC", L"Opgeslagen presets:", 0, 12, 214, 280, 16, 0);
+    MakeHeader(hwnd, L"Opgeslagen presets", 14, 248, 280);
     g_hList = MakeCtrl(hwnd, L"LISTBOX", NULL,
                        WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_SORT,
-                       12, 232, 280, 160, IDC_LIST);
+                       14, 268, 300, 148, IDC_LIST);
 
-    MakeCtrl(hwnd, L"BUTTON", L"Toepassen", BS_DEFPUSHBUTTON, 304, 232, 148, 30, IDC_BTN_APPLY);
-    MakeCtrl(hwnd, L"BUTTON", L"Verwijderen",      0, 304, 268, 148, 26, IDC_BTN_DELETE);
-    MakeCtrl(hwnd, L"BUTTON", L"Lijst vernieuwen", 0, 304, 300, 148, 26, IDC_BTN_REFRESH);
-    MakeCtrl(hwnd, L"BUTTON", L"Presetmap openen", 0, 304, 332, 148, 26, IDC_BTN_FOLDER);
+    MakeCtrl(hwnd, L"BUTTON", L"Toepassen", BS_DEFPUSHBUTTON, 326, 268, 220, 32, IDC_BTN_APPLY);
+    MakeCtrl(hwnd, L"BUTTON", L"Verwijderen",      0, 326, 306, 220, 26, IDC_BTN_DELETE);
+    MakeCtrl(hwnd, L"BUTTON", L"Lijst vernieuwen", 0, 326, 338, 220, 26, IDC_BTN_REFRESH);
+    MakeCtrl(hwnd, L"BUTTON", L"Presetmap openen", 0, 326, 370, 220, 26, IDC_BTN_FOLDER);
 
     /* --- Opslaan --- */
-    MakeCtrl(hwnd, L"STATIC", L"Naam nieuwe preset:", 0, 12, 400, 280, 16, 0);
+    MakeHeader(hwnd, L"Nieuwe preset", 14, 428, 280);
     g_hEdit = MakeCtrl(hwnd, L"EDIT", NULL, WS_BORDER|ES_AUTOHSCROLL,
-                       12, 418, 280, 24, IDC_EDIT_NAME);
-    MakeCtrl(hwnd, L"BUTTON", L"Opslaan als preset", 0, 304, 416, 148, 28, IDC_BTN_SAVE);
+                       14, 448, 300, 26, IDC_EDIT_NAME);
+    SendMessageW(g_hEdit, EM_SETCUEBANNER, TRUE,
+                 (LPARAM)L"Naam, bijv. \"Gamen\" of \"Werk\"");
+    MakeCtrl(hwnd, L"BUTTON", L"Huidige indeling opslaan", 0, 326, 447, 220, 28, IDC_BTN_SAVE);
 
     /* --- Snel schakelen --- */
     MakeCtrl(hwnd, L"BUTTON", L"Snel schakelen (zoals Win+P)", BS_GROUPBOX,
-             12, 452, 516, 58, 0);
-    MakeCtrl(hwnd, L"BUTTON", L"Uitbreiden",    0,  24, 476, 114, 26, IDC_BTN_EXTEND);
-    MakeCtrl(hwnd, L"BUTTON", L"Dupliceren",    0, 146, 476, 114, 26, IDC_BTN_CLONE);
-    MakeCtrl(hwnd, L"BUTTON", L"Alleen scherm 1", 0, 268, 476, 114, 26, IDC_BTN_FIRST);
-    MakeCtrl(hwnd, L"BUTTON", L"Alleen scherm 2", 0, 390, 476, 114, 26, IDC_BTN_SECOND);
+             14, 484, 532, 62, 0);
+    MakeCtrl(hwnd, L"BUTTON", L"Uitbreiden",      0,  26, 508, 122, 28, IDC_BTN_EXTEND);
+    MakeCtrl(hwnd, L"BUTTON", L"Dupliceren",      0, 156, 508, 122, 28, IDC_BTN_CLONE);
+    MakeCtrl(hwnd, L"BUTTON", L"Alleen scherm 1", 0, 286, 508, 122, 28, IDC_BTN_FIRST);
+    MakeCtrl(hwnd, L"BUTTON", L"Alleen scherm 2", 0, 416, 508, 122, 28, IDC_BTN_SECOND);
 
     /* --- Status --- */
     g_hStatus = MakeCtrl(hwnd, L"STATIC", L"Klaar.", SS_LEFTNOWORDWRAP,
-                         12, 520, 516, 16, IDC_STATUS);
+                         14, 556, 532, 17, IDC_STATUS);
 }
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -869,6 +953,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         break;
 
+    case WM_CTLCOLORSTATIC:
+        if (GetDlgCtrlID((HWND)lParam) == IDC_HINT) {
+            SetTextColor((HDC)wParam, RGB(105, 108, 115));
+            SetBkColor((HDC)wParam, GetSysColor(COLOR_BTNFACE));
+            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        }
+        break;
+
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -894,6 +986,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR cmdLine, int nCm
     g_hFontSm = CreateFontW(-MulDiv(8, g_dpi, 72), 0,0,0, FW_NORMAL,0,0,0,
                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                              CLEARTYPE_QUALITY, DEFAULT_PITCH|FF_DONTCARE, L"Segoe UI");
+    g_hFontBold = CreateFontW(-MulDiv(10, g_dpi, 72), 0,0,0, FW_SEMIBOLD,0,0,0,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY, DEFAULT_PITCH|FF_DONTCARE, L"Segoe UI");
+    g_hFontBig = CreateFontW(-MulDiv(20, g_dpi, 72), 0,0,0, FW_BOLD,0,0,0,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                             CLEARTYPE_QUALITY, DEFAULT_PITCH|FF_DONTCARE, L"Segoe UI");
 
     /* Registreer canvasklasse */
     WNDCLASSW cc = {0};
@@ -914,7 +1012,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR cmdLine, int nCm
     wc.hIcon         = LoadIconW(NULL, IDI_APPLICATION);
     RegisterClassW(&wc);
 
-    RECT rc = { 0, 0, S(540), S(544) };
+    RECT rc = { 0, 0, S(560), S(582) };
     AdjustWindowRect(&rc, WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX, FALSE);
 
     HWND hwnd = CreateWindowExW(0, L"SchermPresetsWnd", L"SchermPresets",
@@ -933,5 +1031,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, PWSTR cmdLine, int nCm
     }
     DeleteObject(g_hFont);
     DeleteObject(g_hFontSm);
+    DeleteObject(g_hFontBold);
+    DeleteObject(g_hFontBig);
     return 0;
 }
