@@ -64,6 +64,12 @@ static int     g_nMon;
 static int     g_hover = -1;   /* monitor onder de muis, -1 = geen */
 static HWND    g_hCanvas;
 
+/* Sleepstatus: klik zonder beweging = aan/uit, klik + beweging = verplaatsen */
+static int   g_dragIdx  = -1;
+static BOOL  g_dragging = FALSE;
+static POINT g_dragStart;
+static int   g_dragDx, g_dragDy;   /* huidige sleepafstand in canvas-pixels */
+
 /* Kleuren per monitor (BGR voor GDI) */
 static const COLORREF MON_CLR[] = {
     0xB84010, 0x1050B8, 0x10883C, 0x8830A0,
@@ -257,10 +263,14 @@ static void LoadMonitors(void)
 /* Canvas: interactieve monitorkaart                        */
 /* ======================================================== */
 
-/* Schaal de virtuele monitorpositie naar canvas-coördinaten. */
-static RECT ScaleMonRect(int cw, int ch, int i)
+/* Transformatie tussen virtueel bureaublad en canvas-pixels */
+typedef struct {
+    LONG vl, vt, vw, vh;   /* bounding box virtueel bureaublad */
+    int  aw, ah, ox, oy;   /* schaalgebied + offset op het canvas */
+} Xform;
+
+static void GetXform(int cw, int ch, Xform *x)
 {
-    /* Bounding box van alle monitoren */
     LONG vl = g_mon[0].vRect.left, vt = g_mon[0].vRect.top;
     LONG vr = g_mon[0].vRect.right, vb = g_mon[0].vRect.bottom;
     for (int k = 1; k < g_nMon; k++) {
@@ -269,28 +279,36 @@ static RECT ScaleMonRect(int cw, int ch, int i)
         if (g_mon[k].vRect.right  > vr) vr = g_mon[k].vRect.right;
         if (g_mon[k].vRect.bottom > vb) vb = g_mon[k].vRect.bottom;
     }
-    LONG vw = vr - vl, vh = vb - vt;
-    if (vw <= 0) vw = 1;
-    if (vh <= 0) vh = 1;
+    x->vl = vl; x->vt = vt;
+    x->vw = vr - vl; x->vh = vb - vt;
+    if (x->vw <= 0) x->vw = 1;
+    if (x->vh <= 0) x->vh = 1;
 
     const int PAD = 8;
     int aw = cw - 2*PAD, ah = ch - 2*PAD;
-
-    /* Behoud aspect ratio */
-    if (aw * vh > ah * vw)
-        aw = ah * vw / vh;
+    if (aw * x->vh > ah * x->vw)
+        aw = (int)((LONGLONG)ah * x->vw / x->vh);
     else
-        ah = aw * vh / vw;
+        ah = (int)((LONGLONG)aw * x->vh / x->vw);
+    if (aw < 1) aw = 1;
+    if (ah < 1) ah = 1;
+    x->aw = aw; x->ah = ah;
+    x->ox = PAD + (cw - 2*PAD - aw) / 2;
+    x->oy = PAD + (ch - 2*PAD - ah) / 2;
+}
 
-    int ox = PAD + (cw - 2*PAD - aw) / 2;
-    int oy = PAD + (ch - 2*PAD - ah) / 2;
+/* Schaal de virtuele monitorpositie naar canvas-coördinaten. */
+static RECT ScaleMonRect(int cw, int ch, int i)
+{
+    Xform x;
+    GetXform(cw, ch, &x);
 
     const RECT *r = &g_mon[i].vRect;
     RECT out;
-    out.left   = ox + (r->left   - vl) * aw / vw;
-    out.top    = oy + (r->top    - vt) * ah / vh;
-    out.right  = ox + (r->right  - vl) * aw / vw;
-    out.bottom = oy + (r->bottom - vt) * ah / vh;
+    out.left   = x.ox + (int)((LONGLONG)(r->left   - x.vl) * x.aw / x.vw);
+    out.top    = x.oy + (int)((LONGLONG)(r->top    - x.vt) * x.ah / x.vh);
+    out.right  = x.ox + (int)((LONGLONG)(r->right  - x.vl) * x.aw / x.vw);
+    out.bottom = x.oy + (int)((LONGLONG)(r->bottom - x.vt) * x.ah / x.vh);
     /* minimale grootte zodat de tekst leesbaar is */
     if (out.right  - out.left < 32) out.right  = out.left + 32;
     if (out.bottom - out.top  < 20) out.bottom = out.top  + 20;
@@ -340,11 +358,17 @@ static void PaintCanvas(HWND hwnd)
                   -1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
+    /* Teken het gesleepte scherm als laatste zodat het bovenop ligt */
+    for (int pass = 0; pass < 2; pass++)
     for (int i = 0; i < g_nMon; i++) {
+        BOOL isDrag = (g_dragging && i == g_dragIdx);
+        if ((pass == 0) == isDrag) continue;
+
         RECT r = ScaleMonRect(cw, ch, i);
+        if (isDrag) OffsetRect(&r, g_dragDx, g_dragDy);
         COLORREF baseClr = MON_CLR[i % 8];
         BOOL on = g_mon[i].enabled;
-        BOOL hov = (i == g_hover);
+        BOOL hov = (i == g_hover) || isDrag;
         int rad = S(8);
 
         /* Vulling: kleur voor aan, donkergrijs voor uit; hover licht op */
@@ -517,6 +541,141 @@ static void ToggleMonitorLive(int idx)
     if (g_hCanvas) InvalidateRect(g_hCanvas, NULL, TRUE);
 }
 
+/* ======================================================== */
+/* Monitor verslepen: snappen en toepassen                  */
+/* ======================================================== */
+
+static BOOL RectsOverlap(const RECT *a, const RECT *b)
+{
+    return a->left < b->right && b->left < a->right &&
+           a->top < b->bottom && b->top < a->bottom;
+}
+
+static BOOL OverlapsOtherEnabled(int idx, const RECT *r)
+{
+    for (int k = 0; k < g_nMon; k++) {
+        if (k == idx || !g_mon[k].enabled) continue;
+        if (RectsOverlap(r, &g_mon[k].vRect)) return TRUE;
+    }
+    return FALSE;
+}
+
+/* Windows eist dat schermen elkaar raken zonder overlap. Zoek de geldige
+ * positie (tegen een zijde van een ander scherm) die het dichtst bij de
+ * losgelaten positie ligt. */
+static void SnapToLayout(int idx, LONG *px, LONG *py)
+{
+    LONG w = g_mon[idx].vRect.right  - g_mon[idx].vRect.left;
+    LONG h = g_mon[idx].vRect.bottom - g_mon[idx].vRect.top;
+    LONGLONG bestD = -1;
+    LONG bx = *px, by = *py;
+    BOOL anyOther = FALSE;
+
+    for (int k = 0; k < g_nMon; k++) {
+        if (k == idx || !g_mon[k].enabled) continue;
+        anyOther = TRUE;
+        const RECT *o = &g_mon[k].vRect;
+
+        /* Klem de vrije as zodat de schermen elkaar blijven raken */
+        LONG cy = *py;
+        if (cy < o->top - h + 1)  cy = o->top - h + 1;
+        if (cy > o->bottom - 1)   cy = o->bottom - 1;
+        LONG cx = *px;
+        if (cx < o->left - w + 1) cx = o->left - w + 1;
+        if (cx > o->right - 1)    cx = o->right - 1;
+
+        POINT cand[4] = {
+            { o->right,    cy },   /* rechts van dit scherm */
+            { o->left - w, cy },   /* links                 */
+            { cx, o->bottom },     /* eronder               */
+            { cx, o->top - h },    /* erboven               */
+        };
+        for (int c = 0; c < 4; c++) {
+            RECT t = { cand[c].x, cand[c].y, cand[c].x + w, cand[c].y + h };
+            if (OverlapsOtherEnabled(idx, &t)) continue;
+            LONGLONG dx = (LONGLONG)cand[c].x - *px;
+            LONGLONG dy = (LONGLONG)cand[c].y - *py;
+            LONGLONG d = dx*dx + dy*dy;
+            if (bestD < 0 || d < bestD) { bestD = d; bx = cand[c].x; by = cand[c].y; }
+        }
+    }
+
+    if (!anyOther) { *px = 0; *py = 0; return; }   /* enige actieve scherm */
+    if (bestD >= 0) { *px = bx; *py = by; }
+    else { *px = g_mon[idx].vRect.left; *py = g_mon[idx].vRect.top; }  /* geen plek: terug */
+}
+
+static void ApplyMonitorPosition(int idx, LONG nx, LONG ny)
+{
+    Monitor *mon = &g_mon[idx];
+
+    if (nx == mon->vRect.left && ny == mon->vRect.top) {
+        SetStatus(L"Positie van '%s' ongewijzigd.", mon->name);
+        return;
+    }
+
+    DISPLAYCONFIG_PATH_INFO *paths; DISPLAYCONFIG_MODE_INFO *modes;
+    UINT32 np, nm;
+    if (QueryCCD(&paths, &np, &modes, &nm, QDC_ONLY_ACTIVE_PATHS) != ERROR_SUCCESS) {
+        SetStatus(L"Kon schermconfiguratie niet opvragen.");
+        return;
+    }
+
+    /* Zoek de bronmodus van het gesleepte scherm */
+    UINT32 srcIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+    for (UINT32 i = 0; i < np; i++) {
+        if (LuidEq(paths[i].targetInfo.adapterId, mon->adapterId) &&
+            paths[i].targetInfo.id == mon->targetId) {
+            srcIdx = paths[i].sourceInfo.modeInfoIdx;
+            break;
+        }
+    }
+    if (srcIdx == DISPLAYCONFIG_PATH_MODE_IDX_INVALID || srcIdx >= nm ||
+        modes[srcIdx].infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+        free(paths); free(modes);
+        SetStatus(L"Kon bronmodus van '%s' niet vinden.", mon->name);
+        return;
+    }
+
+    /* Onthoud welke bron primair is (positie 0,0) vóór de wijziging */
+    int primIdx = -1;
+    for (UINT32 m = 0; m < nm; m++) {
+        if (modes[m].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE &&
+            modes[m].sourceMode.position.x == 0 &&
+            modes[m].sourceMode.position.y == 0) { primIdx = (int)m; break; }
+    }
+
+    modes[srcIdx].sourceMode.position.x = nx;
+    modes[srcIdx].sourceMode.position.y = ny;
+
+    /* Normaliseer: de primaire bron moet op (0,0) blijven */
+    if (primIdx >= 0) {
+        LONG ox = modes[primIdx].sourceMode.position.x;
+        LONG oy = modes[primIdx].sourceMode.position.y;
+        if (ox != 0 || oy != 0) {
+            for (UINT32 m = 0; m < nm; m++) {
+                if (modes[m].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE) {
+                    modes[m].sourceMode.position.x -= ox;
+                    modes[m].sourceMode.position.y -= oy;
+                }
+            }
+        }
+    }
+
+    LONG rc = SetDisplayConfig(np, paths, nm, modes,
+                               SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG |
+                               SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE);
+    free(paths); free(modes);
+
+    if (rc != ERROR_SUCCESS)
+        SetStatus(L"Verplaatsen van '%s' mislukt (fout %ld).", mon->name, rc);
+    else
+        SetStatus(L"Scherm '%s' verplaatst.", mon->name);
+
+    LoadMonitors();
+    if (g_hCanvas) InvalidateRect(g_hCanvas, NULL, TRUE);
+}
+
 static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
@@ -528,9 +687,23 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         return 1;   /* alles wordt in PaintCanvas getekend (double buffered) */
 
     case WM_MOUSEMOVE: {
+        int mx = GET_X_LPARAM(lParam), my = GET_Y_LPARAM(lParam);
+
+        /* Bezig met (mogelijk) slepen? */
+        if (g_dragIdx >= 0 && (wParam & MK_LBUTTON)) {
+            int dx = mx - g_dragStart.x, dy = my - g_dragStart.y;
+            if (!g_dragging && g_mon[g_dragIdx].enabled &&
+                (abs(dx) > S(4) || abs(dy) > S(4)))
+                g_dragging = TRUE;
+            if (g_dragging) {
+                g_dragDx = dx; g_dragDy = dy;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+
         RECT cr; GetClientRect(hwnd, &cr);
-        int idx = HitTest(cr.right, cr.bottom,
-                          GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        int idx = HitTest(cr.right, cr.bottom, mx, my);
         if (idx != g_hover) {
             g_hover = idx;
             InvalidateRect(hwnd, NULL, FALSE);
@@ -541,7 +714,7 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
     }
 
     case WM_MOUSELEAVE:
-        if (g_hover != -1) {
+        if (g_hover != -1 && !g_dragging) {
             g_hover = -1;
             InvalidateRect(hwnd, NULL, FALSE);
         }
@@ -553,7 +726,40 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         int idx = HitTest(cr.right, cr.bottom, mx, my);
         if (idx < 0) return 0;
 
-        /* Blokkeer uitzetten van het laatste actieve scherm */
+        /* Start mogelijke sleepactie; de beslissing klik-of-sleep valt
+         * pas bij het loslaten van de muisknop. */
+        g_dragIdx = idx;
+        g_dragging = FALSE;
+        g_dragStart.x = mx; g_dragStart.y = my;
+        g_dragDx = g_dragDy = 0;
+        SetCapture(hwnd);
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (g_dragIdx < 0) return 0;
+        int idx = g_dragIdx;
+        BOOL wasDrag = g_dragging;
+        g_dragIdx = -1;
+        g_dragging = FALSE;
+        ReleaseCapture();
+
+        if (wasDrag) {
+            /* Sleepafstand terugvertalen naar het virtuele bureaublad */
+            RECT cr; GetClientRect(hwnd, &cr);
+            Xform x;
+            GetXform(cr.right, cr.bottom, &x);
+            LONG nx = g_mon[idx].vRect.left + (LONG)((LONGLONG)g_dragDx * x.vw / x.aw);
+            LONG ny = g_mon[idx].vRect.top  + (LONG)((LONGLONG)g_dragDy * x.vh / x.ah);
+            g_dragDx = g_dragDy = 0;
+
+            SnapToLayout(idx, &nx, &ny);
+            ApplyMonitorPosition(idx, nx, ny);
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+
+        /* Gewone klik: scherm aan/uit. Blokkeer het laatste actieve scherm. */
         if (g_mon[idx].enabled) {
             int aantalAan = 0;
             for (int k = 0; k < g_nMon; k++) aantalAan += g_mon[k].enabled;
@@ -563,11 +769,18 @@ static LRESULT CALLBACK CanvasProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
                 return 0;
             }
         }
-
-        /* Pas direct toe in Windows */
         ToggleMonitorLive(idx);
         return 0;
     }
+
+    case WM_CAPTURECHANGED:
+        if (g_dragIdx >= 0) {
+            g_dragIdx = -1;
+            g_dragging = FALSE;
+            g_dragDx = g_dragDy = 0;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
 
     case WM_SETCURSOR: {
         RECT cr; GetClientRect(hwnd, &cr);
@@ -886,7 +1099,7 @@ static void CreateControls(HWND hwnd)
 
     MakeCtrl(hwnd, L"BUTTON", L"Indeling herladen", 0, 14, 208, 140, 26, IDC_BTN_RELOAD);
     MakeCtrl(hwnd, L"STATIC",
-             L"Klik op een scherm om het direct aan of uit te zetten.",
+             L"Klik = scherm aan/uit  ·  Slepen = scherm verplaatsen",
              SS_LEFTNOWORDWRAP | SS_CENTERIMAGE, 164, 208, 382, 26, IDC_HINT);
 
     /* --- Presetlijst --- */
